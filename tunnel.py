@@ -22,9 +22,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+import applog
 import netcfg
 import wgproto
 import wintun
+
+log = applog.get("tunnel")
 
 
 @dataclass
@@ -131,15 +134,30 @@ class Tunnel:
 
     # ---- lifecycle ----
     def start(self) -> None:
+        log.info("start[%s] begin: peer=%s allowed_ips=%s addr=%s dns=%s",
+                 self.config.name, self.config.peer_endpoint,
+                 self.config.allowed_ips, self.config.address, self.config.dns)
         try:
             self._open_socket_and_resolve()
+            log.info("start[%s] step1 OK: endpoint resolved -> %s",
+                     self.config.name, self._endpoint)
             self._open_adapter()
+            log.info("start[%s] step2 OK: adapter opened, session started",
+                     self.config.name)
             self._configure_adapter()
+            log.info("start[%s] step3 OK: adapter IP/DNS configured",
+                     self.config.name)
             self._do_handshake()
+            log.info("start[%s] step4 OK: handshake complete, remote_idx=%#x",
+                     self.config.name, self._state.remote_index)
             self._configure_routes()
+            log.info("start[%s] step5 OK: routes added=%s endpoint_route=%s",
+                     self.config.name, self._added_routes, self._endpoint_route_added)
             self._start_io_threads()
+            log.info("start[%s] step6 OK: IO threads running", self.config.name)
             self._started_at = time.time()
-        except Exception:
+        except Exception as e:
+            log.exception("start[%s] FAILED: %s", self.config.name, e)
             self.stop()
             raise
 
@@ -224,25 +242,38 @@ class Tunnel:
         for attempt in range(self.HANDSHAKE_ATTEMPTS):
             msg = wgproto.build_initiation(state)
             self._udp.settimeout(self.HANDSHAKE_TIMEOUT)
+            log.info("handshake attempt %d/%d: sending %d-byte initiation to %s (local_idx=%#x)",
+                     attempt + 1, self.HANDSHAKE_ATTEMPTS, len(msg),
+                     self._endpoint, state.local_index)
             try:
                 self._udp.sendto(msg, self._endpoint)
                 while True:
                     data, src = self._udp.recvfrom(2048)
+                    log.info("handshake recv: %d bytes from %s, type=%d",
+                             len(data) if data else 0, src,
+                             data[0] if data else -1)
                     if not data:
                         continue
                     msg_type = data[0] if data else 0
-                    if msg_type == wgproto.MSG_RESPONSE and wgproto.consume_response(state, data):
-                        self._state = state
-                        self._last_handshake_at = time.time()
-                        self._udp.settimeout(None)
-                        return
+                    if msg_type == wgproto.MSG_RESPONSE:
+                        ok = wgproto.consume_response(state, data)
+                        log.info("handshake: consume_response -> %s", ok)
+                        if ok:
+                            self._state = state
+                            self._last_handshake_at = time.time()
+                            self._udp.settimeout(None)
+                            return
                     # Ignore cookies/transport at this stage; loop until timeout
             except socket.timeout:
                 last_err = TimeoutError(f"handshake attempt {attempt + 1} timed out")
+                log.warning("handshake: attempt %d timed out", attempt + 1)
                 continue
             except OSError as e:
                 last_err = e
+                log.warning("handshake: socket error: %s", e)
                 break
+        log.error("handshake FAILED after %d attempts: %s",
+                  self.HANDSHAKE_ATTEMPTS, last_err)
         raise RuntimeError(f"handshake failed: {last_err}")
 
     def _configure_routes(self) -> None:
@@ -287,10 +318,12 @@ class Tunnel:
         self._threads = [t1, t2, t3]
 
     def _tun_to_udp_loop(self) -> None:
+        sent = 0
         while not self._stop.is_set():
             try:
                 pkt = self._session.receive_packet(wait_ms=500)
-            except Exception:
+            except Exception as e:
+                log.warning("tun→udp: session.receive_packet error: %s", e)
                 break
             if pkt is None:
                 continue
@@ -300,31 +333,59 @@ class Tunnel:
                 with self._lock:
                     self._tx += len(pkt)
                     self._last_tx_at = time.time()
-            except Exception:
+                sent += 1
+                if sent <= 5 or sent % 200 == 0:
+                    log.debug("tun→udp #%d: %d B plaintext → %d B ciphertext to %s",
+                              sent, len(pkt), len(enc), self._endpoint)
+            except Exception as e:
+                log.warning("tun→udp: send error: %s", e)
                 continue
 
     def _udp_to_tun_loop(self) -> None:
         buf_size = 65535
+        recv_total = 0
+        recv_transport = 0
+        recv_other = 0
+        decrypt_fail = 0
         while not self._stop.is_set():
             try:
-                data, _ = self._udp.recvfrom(buf_size)
-            except (OSError, socket.error):
+                data, addr = self._udp.recvfrom(buf_size)
+            except (OSError, socket.error) as e:
+                log.info("udp→tun: socket closed/error: %s", e)
                 break
             if not data:
                 continue
+            recv_total += 1
             msg_type = data[0]
             if msg_type == wgproto.MSG_TRANSPORT:
                 pt = wgproto.consume_transport(self._state, self._replay, data)
-                if pt is None or not pt:
+                if pt is None:
+                    decrypt_fail += 1
+                    if decrypt_fail <= 5 or decrypt_fail % 100 == 0:
+                        log.warning("udp→tun: decrypt FAILED (#%d) from %s, %d B",
+                                    decrypt_fail, addr, len(data))
+                    continue
+                if not pt:
+                    # Keepalive (empty payload) — valid but nothing to write
+                    log.debug("udp→tun: keepalive received from %s", addr)
                     continue
                 try:
                     self._session.send_packet(pt)
                     with self._lock:
                         self._rx += len(pt)
                         self._last_rx_at = time.time()
-                except Exception:
+                    recv_transport += 1
+                    if recv_transport <= 5 or recv_transport % 200 == 0:
+                        log.debug("udp→tun #%d: %d B ciphertext from %s → %d B to TUN",
+                                  recv_transport, len(data), addr, len(pt))
+                except Exception as e:
+                    log.warning("udp→tun: session.send_packet error: %s", e)
                     continue
-            # else: ignore cookies/init/response — rekey not implemented here
+            else:
+                recv_other += 1
+                if recv_other <= 3:
+                    log.info("udp→tun: non-transport packet type=%d from %s, %d B",
+                             msg_type, addr, len(data))
 
     def _timer_loop(self) -> None:
         next_keepalive = (

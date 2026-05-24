@@ -6,6 +6,9 @@ import ipaddress
 import subprocess
 from typing import Optional
 
+import applog
+
+log = applog.get("netcfg")
 
 _NO_WIN = 0
 try:
@@ -17,7 +20,9 @@ except AttributeError:
 def _netsh(*args: str) -> tuple[int, str]:
     r = subprocess.run(["netsh", *args], capture_output=True, text=True,
                        creationflags=_NO_WIN)
-    return r.returncode, (r.stdout + r.stderr).strip()
+    out = (r.stdout + r.stderr).strip()
+    log.debug("netsh %s -> rc=%d %s", " ".join(args), r.returncode, out[:200])
+    return r.returncode, out
 
 
 def _ipv4_mask(prefix_len: int) -> str:
