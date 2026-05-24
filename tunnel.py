@@ -191,12 +191,19 @@ class Tunnel:
         self._session = self._adapter.start_session()
 
     def _configure_adapter(self) -> None:
+        # Wintun is point-to-point. Always assign the interface IP as /32
+        # (or /128 for v6) regardless of what the .conf prefix says — any
+        # wider mask makes Windows auto-add an On-link route covering that
+        # whole subnet (e.g. a /0 mask creates a 0.0.0.0/0 On-link route
+        # that hijacks the WG-server UDP itself, breaking the tunnel).
         for i, cidr in enumerate(self.config.address):
             try:
+                ip_obj = ipaddress.ip_interface(cidr).ip
+                host_cidr = f"{ip_obj}/{'32' if ip_obj.version == 4 else '128'}"
                 if i == 0:
-                    netcfg.set_address(self.config.name, cidr)
+                    netcfg.set_address(self.config.name, host_cidr)
                 else:
-                    netcfg.add_address(self.config.name, cidr)
+                    netcfg.add_address(self.config.name, host_cidr)
             except Exception:
                 pass
         if self.config.dns:
