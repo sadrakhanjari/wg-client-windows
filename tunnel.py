@@ -239,20 +239,28 @@ class Tunnel:
         raise RuntimeError(f"handshake failed: {last_err}")
 
     def _configure_routes(self) -> None:
-        full_tunnel = any(
-            c.startswith("0.0.0.0/0") or c.startswith("::/0")
-            for c in self.config.allowed_ips
-        )
-        if full_tunnel:
-            try:
-                gw = netcfg.get_default_gateway(4)
-                if gw:
-                    endpoint_cidr = f"{self._endpoint[0]}/32"
-                    netcfg.add_route_via(endpoint_cidr, gw, metric=1)
-                    self._endpoint_route_added = endpoint_cidr
-            except Exception:
-                pass
+        # Pin WG server endpoint to the real default gateway so encrypted UDP
+        # never goes through our own tunnel (would be a recursive loop).
+        try:
+            gw = netcfg.get_default_gateway(4)
+            if gw:
+                endpoint_cidr = f"{self._endpoint[0]}/32"
+                netcfg.add_route_via(endpoint_cidr, gw, metric=1)
+                self._endpoint_route_added = endpoint_cidr
+        except Exception:
+            pass
+
+        # For AllowedIPs, expand "catch-all" prefixes to two /1 halves so the
+        # original 0.0.0.0/0 default route remains free for endpoint traffic.
+        expanded: list[str] = []
         for cidr in self.config.allowed_ips:
+            if cidr.strip() in ("0.0.0.0/0", "0/0"):
+                expanded += ["0.0.0.0/1", "128.0.0.0/1"]
+            elif cidr.strip() == "::/0":
+                expanded += ["::/1", "8000::/1"]
+            else:
+                expanded.append(cidr)
+        for cidr in expanded:
             try:
                 netcfg.add_route(self.config.name, cidr, metric=5)
                 self._added_routes.append(cidr)
