@@ -10,6 +10,8 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 import wgapi
+import settings as appsettings
+from monitor import AutoReconnectMonitor
 
 
 COLOR_BG = "#1e1f22"
@@ -228,6 +230,111 @@ class TunnelDialog(ctk.CTkToplevel):
         self.destroy()
 
 
+class SettingsDialog(ctk.CTkToplevel):
+    def __init__(self, parent, tunnel_name: str | None = None):
+        super().__init__(parent)
+        self.title("Settings" + (f" — {tunnel_name}" if tunnel_name else ""))
+        self.geometry("520x440")
+        self.configure(fg_color=COLOR_BG)
+        self.tunnel_name = tunnel_name
+        self.transient(parent)
+        self.grab_set()
+        self.result_saved = False
+
+        # Load current effective values
+        if tunnel_name:
+            self.current = appsettings.get_auto_reconnect_for(tunnel_name)
+            s = appsettings.load()
+            override_exists = "auto_reconnect" in s.per_tunnel.get(tunnel_name, {})
+        else:
+            s = appsettings.load()
+            self.current = s.auto_reconnect
+            override_exists = False
+
+        ctk.CTkLabel(self, text="Auto-reconnect", font=(FONT_FAMILY, 16, "bold"),
+                     anchor="w").pack(fill="x", padx=24, pady=(20, 4))
+        ctk.CTkLabel(self,
+                     text="Reconnect when download speed stays below a threshold.",
+                     text_color=COLOR_MUTED, anchor="w", justify="left",
+                     wraplength=460).pack(fill="x", padx=24, pady=(0, 14))
+
+        self.enabled_var = ctk.BooleanVar(value=self.current.enabled)
+        ctk.CTkCheckBox(self, text="Enable auto-reconnect",
+                        variable=self.enabled_var,
+                        fg_color=COLOR_PRIMARY,
+                        hover_color=COLOR_PRIMARY_HOVER).pack(
+            anchor="w", padx=24, pady=4)
+
+        grid = ctk.CTkFrame(self, fg_color="transparent")
+        grid.pack(fill="x", padx=24, pady=10)
+        grid.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(grid, text="Min download speed (KB/s)").grid(
+            row=0, column=0, sticky="w", pady=6)
+        self.min_kbps_in = ctk.CTkEntry(grid, width=120)
+        self.min_kbps_in.insert(0, str(self.current.min_kbps))
+        self.min_kbps_in.grid(row=0, column=1, sticky="w", pady=6, padx=8)
+
+        ctk.CTkLabel(grid, text="Window length (seconds)").grid(
+            row=1, column=0, sticky="w", pady=6)
+        self.window_in = ctk.CTkEntry(grid, width=120)
+        self.window_in.insert(0, str(self.current.window_sec))
+        self.window_in.grid(row=1, column=1, sticky="w", pady=6, padx=8)
+
+        ctk.CTkLabel(grid, text="Reconnect delay (seconds)").grid(
+            row=2, column=0, sticky="w", pady=6)
+        self.delay_in = ctk.CTkEntry(grid, width=120)
+        self.delay_in.insert(0, str(self.current.delay_sec))
+        self.delay_in.grid(row=2, column=1, sticky="w", pady=6, padx=8)
+
+        if tunnel_name:
+            self.override_var = ctk.BooleanVar(value=override_exists)
+            ctk.CTkCheckBox(self,
+                            text=f"Override global settings for this tunnel ('{tunnel_name}')",
+                            variable=self.override_var,
+                            fg_color=COLOR_PRIMARY,
+                            hover_color=COLOR_PRIMARY_HOVER).pack(
+                anchor="w", padx=24, pady=(8, 0))
+
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.pack(fill="x", padx=24, pady=(18, 16), side="bottom")
+        ctk.CTkButton(btns, text="Cancel", width=100, height=34,
+                      fg_color=COLOR_SEL, hover_color=COLOR_HOVER,
+                      command=self.destroy).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btns, text="Save", width=120, height=34,
+                      fg_color=COLOR_PRIMARY, hover_color=COLOR_PRIMARY_HOVER,
+                      command=self._save).pack(side="right")
+
+        self.bind("<Escape>", lambda e: self.destroy())
+
+    def _save(self):
+        try:
+            min_kbps = max(0, int(self.min_kbps_in.get().strip() or "0"))
+            window = max(1, int(self.window_in.get().strip() or "1"))
+            delay = max(0, int(self.delay_in.get().strip() or "0"))
+        except ValueError:
+            messagebox.showwarning("Invalid", "Numbers required for thresholds.",
+                                    parent=self)
+            return
+        ar = appsettings.AutoReconnect(
+            enabled=self.enabled_var.get(),
+            min_kbps=min_kbps,
+            window_sec=window,
+            delay_sec=delay,
+        )
+        if self.tunnel_name:
+            if getattr(self, "override_var", None) and self.override_var.get():
+                appsettings.set_auto_reconnect_per_tunnel(self.tunnel_name, ar)
+            else:
+                appsettings.set_auto_reconnect_per_tunnel(self.tunnel_name, None)
+                # If they don't override, the global values should reflect what's shown
+                appsettings.set_auto_reconnect_global(ar)
+        else:
+            appsettings.set_auto_reconnect_global(ar)
+        self.result_saved = True
+        self.destroy()
+
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -244,6 +351,8 @@ class App(ctk.CTk):
         self.tunnel_buttons: dict[str, ctk.CTkButton] = {}
         self._busy: bool = False
         self._current_ping_host: str | None = None
+        self._reconnect_monitor: AutoReconnectMonitor | None = None
+        self._reconnect_status: str = ""
 
         ctk.set_appearance_mode("dark")
         self._build()
@@ -273,7 +382,7 @@ class App(ctk.CTk):
         self.list_frame.grid(row=1, column=0, sticky="nsew", padx=6)
 
         btn_row = ctk.CTkFrame(side, fg_color="transparent")
-        btn_row.grid(row=2, column=0, sticky="ew", padx=10, pady=10)
+        btn_row.grid(row=2, column=0, sticky="ew", padx=10, pady=(10, 4))
         btn_row.grid_columnconfigure((0, 1), weight=1)
         ctk.CTkButton(btn_row, text="+ Add", height=32,
                       fg_color=COLOR_SEL, hover_color=COLOR_HOVER,
@@ -281,6 +390,12 @@ class App(ctk.CTk):
         ctk.CTkButton(btn_row, text="Delete", height=32,
                       fg_color=COLOR_DANGER, hover_color=COLOR_DANGER_HOVER,
                       command=self.on_delete).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+        ctk.CTkButton(side, text="⚙  Settings", height=32, anchor="w",
+                      fg_color="transparent", hover_color=COLOR_HOVER,
+                      text_color=COLOR_MUTED,
+                      command=self.on_open_settings).grid(
+            row=3, column=0, sticky="ew", padx=10, pady=(0, 10))
 
         self.detail = ctk.CTkFrame(self, fg_color=COLOR_BG, corner_radius=0)
         self.detail.grid(row=0, column=1, sticky="nsew")
@@ -436,6 +551,13 @@ class App(ctk.CTk):
             self.current = None
         self.refresh_tunnels()
 
+    def on_open_settings(self):
+        d = SettingsDialog(self, tunnel_name=self.current)
+        self.wait_window(d)
+        # If a monitor is running and the active tunnel's settings changed,
+        # the monitor reads settings dynamically via settings_provider, so it
+        # picks up the new values on next tick — no action needed.
+
     def on_toggle(self):
         if not self.current or self._busy: return
         name = self.current
@@ -446,14 +568,17 @@ class App(ctk.CTk):
     def _toggle_worker(self, name: str):
         try:
             if wgapi.is_active(name):
+                self._stop_reconnect_monitor()
                 ok, msg = wgapi.deactivate(name)
             else:
                 active = wgapi.get_active_tunnel()
                 if active and active != name:
+                    self._stop_reconnect_monitor()
                     wgapi.deactivate(active)
                 ok, msg = wgapi.activate(name)
                 if ok:
                     self.activated_at[name] = time.time()
+                    self._start_reconnect_monitor(name)
         except Exception as e:
             ok, msg = False, str(e)
         self.after(0, lambda: self._after_toggle(ok, msg))
@@ -463,6 +588,37 @@ class App(ctk.CTk):
         if not ok:
             messagebox.showerror("Operation failed", msg, parent=self)
         self.poller.poke()
+
+    def _start_reconnect_monitor(self, name: str):
+        self._stop_reconnect_monitor()
+        self._reconnect_status = ""
+        ar = appsettings.get_auto_reconnect_for(name)
+        if not ar.enabled:
+            return
+        self._reconnect_monitor = AutoReconnectMonitor(
+            name, callback=self._on_reconnect_event,
+        )
+        self._reconnect_monitor.start()
+
+    def _stop_reconnect_monitor(self):
+        if self._reconnect_monitor:
+            self._reconnect_monitor.stop()
+            self._reconnect_monitor = None
+
+    def _on_reconnect_event(self, evt: str, info: str):
+        # Called from monitor thread — marshal to main loop
+        self.after(0, lambda: self._handle_reconnect_event(evt, info))
+
+    def _handle_reconnect_event(self, evt: str, info: str):
+        if evt == "reconnect_triggered":
+            self._reconnect_status = f"Slow link — reconnecting ({info})"
+        elif evt == "reconnect_done":
+            self._reconnect_status = "Reconnected"
+            # Reset activated_at so uptime resets
+            if self.current:
+                self.activated_at[self.current] = time.time()
+        elif evt == "reconnect_failed":
+            self._reconnect_status = f"Reconnect failed: {info}"
 
     def _run_async(self, work, done):
         if self._busy: return
@@ -504,13 +660,17 @@ class App(ctk.CTk):
 
         if not self._busy:
             if active:
-                self.status_lbl.configure(text="● Active", text_color=COLOR_OK)
+                txt = "● Active"
+                if self._reconnect_status:
+                    txt = f"● Active  ·  {self._reconnect_status}"
+                self.status_lbl.configure(text=txt, text_color=COLOR_OK)
                 self.toggle_btn.configure(text="Disconnect",
                                            fg_color=COLOR_DANGER, hover_color=COLOR_DANGER_HOVER)
             else:
                 self.status_lbl.configure(text="Inactive", text_color=COLOR_MUTED)
                 self.toggle_btn.configure(text="Connect",
                                            fg_color=COLOR_PRIMARY, hover_color=COLOR_PRIMARY_HOVER)
+                self._reconnect_status = ""
 
         if active and stats:
             rx = stats["rx_bytes"]; tx = stats["tx_bytes"]
@@ -577,6 +737,7 @@ class App(ctk.CTk):
 
     def _on_close(self):
         self._stop_ping()
+        self._stop_reconnect_monitor()
         self.poller.stop()
         self.destroy()
 
