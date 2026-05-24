@@ -56,7 +56,7 @@ class StatsPoller(threading.Thread):
     """Polls is_active + get_stats for the currently selected tunnel in background."""
     def __init__(self):
         super().__init__(daemon=True)
-        self._stop = threading.Event()
+        self._stop_evt = threading.Event()
         self._wake = threading.Event()
         self._lock = threading.Lock()
         self._tunnel: str | None = None
@@ -73,7 +73,7 @@ class StatsPoller(threading.Thread):
         self._wake.set()
 
     def stop(self):
-        self._stop.set()
+        self._stop_evt.set()
         self._wake.set()
 
     def get_snapshot(self) -> dict:
@@ -81,7 +81,7 @@ class StatsPoller(threading.Thread):
             return dict(self._snapshot)
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             with self._lock:
                 t = self._tunnel
             if t:
@@ -105,10 +105,10 @@ class PingThread(threading.Thread):
         super().__init__(daemon=True)
         self.host = host
         self.callback = callback
-        self._stop = threading.Event()
+        self._stop_evt = threading.Event()
 
     def stop(self):
-        self._stop.set()
+        self._stop_evt.set()
 
     def _ping_once(self) -> float:
         try:
@@ -138,14 +138,14 @@ class PingThread(threading.Thread):
             return -1.0
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             ms = self._ping_once()
-            if not self._stop.is_set():
+            if not self._stop_evt.is_set():
                 try:
                     self.callback(self.host, ms)
                 except Exception:
                     return
-            self._stop.wait(1.0)
+            self._stop_evt.wait(1.0)
 
 
 class TunnelDialog(ctk.CTkToplevel):
