@@ -115,35 +115,47 @@ def delete_route(adapter_name: str, dest_cidr: str) -> None:
     )
 
 
-def add_route_via(dest_cidr: str, gateway: str, metric: int = 1) -> None:
-    """Add a route via a specific next-hop gateway (not bound to our adapter).
+def add_route_via(dest_cidr: str, gateway: str, interface: str,
+                  metric: int = 1) -> None:
+    """Add a route via a specific next-hop gateway on a given interface.
 
     Used to force WG-server endpoint traffic to go through the user's real
     default gateway when AllowedIPs include 0.0.0.0/0.
+
+    netsh `add route` REQUIRES `interface=`; without it netsh prints
+    "One or more essential parameters were not entered" yet still exits 0,
+    so we must validate the textual output, not just the return code.
     """
     net = ipaddress.ip_network(dest_cidr, strict=False)
     family = "ipv4" if net.version == 4 else "ipv6"
     rc, out = _netsh(
         "interface", family, "add", "route",
         f"prefix={net.with_prefixlen}",
+        f"interface={interface}",
         f"nexthop={gateway}",
         f"metric={metric}", "store=active",
     )
-    if rc != 0:
-        raise RuntimeError(f"add_route_via({dest_cidr} via {gateway}): {out}")
+    if rc != 0 or "ok." not in out.lower():
+        raise RuntimeError(
+            f"add_route_via({dest_cidr} via {gateway} if {interface}): {out}")
 
 
-def delete_route_via(dest_cidr: str) -> None:
+def delete_route_via(dest_cidr: str, interface: str) -> None:
     net = ipaddress.ip_network(dest_cidr, strict=False)
     family = "ipv4" if net.version == 4 else "ipv6"
     _netsh(
         "interface", family, "delete", "route",
         f"prefix={net.with_prefixlen}",
+        f"interface={interface}",
     )
 
 
-def get_default_gateway(family: int = 4) -> Optional[str]:
-    """Return current default gateway IP (the user's real internet gateway)."""
+def get_default_gateway_info(family: int = 4) -> Optional[tuple[str, Optional[int]]]:
+    """Return (gateway_ip, interface_index) for the lowest-metric default route.
+
+    The interface index is needed because netsh `add route` requires an
+    explicit `interface=` even when a next-hop gateway is given.
+    """
     fam = "ipv4" if family == 4 else "ipv6"
     target = "0.0.0.0/0" if family == 4 else "::/0"
     r = subprocess.run(
@@ -151,6 +163,7 @@ def get_default_gateway(family: int = 4) -> Optional[str]:
         capture_output=True, text=True, creationflags=_NO_WIN,
     )
     best = None
+    best_idx = None
     best_metric = None
     for line in r.stdout.splitlines():
         line = line.strip()
@@ -159,21 +172,30 @@ def get_default_gateway(family: int = 4) -> Optional[str]:
         parts = line.split()
         # Format columns: Publish Type Met Prefix Idx Gateway/Interface Name
         try:
-            met_idx = next(i for i, p in enumerate(parts) if p.isdigit())
-            metric = int(parts[met_idx])
+            met_pos = next(i for i, p in enumerate(parts) if p.isdigit())
+            metric = int(parts[met_pos])
         except StopIteration:
             continue
-        # Find IP-looking token (next hop) after the prefix
-        for p in parts[met_idx + 1:]:
+        # The next IP-looking token is the gateway; the digit token right
+        # before it is the interface index.
+        for j in range(met_pos + 1, len(parts)):
             try:
-                ipaddress.ip_address(p)
-                if best_metric is None or metric < best_metric:
-                    best = p
-                    best_metric = metric
-                break
+                ipaddress.ip_address(parts[j])
             except ValueError:
                 continue
-    return best
+            idx = int(parts[j - 1]) if parts[j - 1].isdigit() else None
+            if best_metric is None or metric < best_metric:
+                best, best_idx, best_metric = parts[j], idx, metric
+            break
+    if best is None:
+        return None
+    return best, best_idx
+
+
+def get_default_gateway(family: int = 4) -> Optional[str]:
+    """Return current default gateway IP (the user's real internet gateway)."""
+    info = get_default_gateway_info(family)
+    return info[0] if info else None
 
 
 def get_adapter_index(adapter_name: str) -> Optional[int]:

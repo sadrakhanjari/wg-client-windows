@@ -155,6 +155,14 @@ def activate(name: str) -> tuple[bool, str]:
         cfg = _tun.parse_config(text, name=name)
     except Exception as e:
         return False, f"Config invalid: {e}"
+    # Attach per-tunnel split-routing rules from app settings.
+    try:
+        import settings as _settings
+        sp = _settings.get_split(name)
+        cfg.split_mode = sp.mode
+        cfg.split_rules = sp.rules
+    except Exception:
+        pass
     # Disconnect any other active tunnel (Wintun semantics + routing conflicts)
     other = get_active_tunnel()
     if other and other != name:
@@ -198,6 +206,30 @@ def get_stats(name: str) -> Optional[dict]:
         "last_handshake": int(s["last_handshake"]),
         "endpoint": s["endpoint"],
     }
+
+
+def set_dns(name: str, servers: list[str]) -> tuple[bool, str]:
+    """Apply DNS servers to a running tunnel's adapter. Empty = revert to
+    the tunnel's configured DNS. Tunnel must be active."""
+    with _lock:
+        t = _active.get(name)
+    if not t or not t.is_running:
+        return False, "tunnel not active"
+    try:
+        t.set_dns(servers)
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
+
+def get_endpoint_ip(name: str) -> Optional[str]:
+    """Resolved server IP for an active tunnel (for geo lookup)."""
+    with _lock:
+        t = _active.get(name)
+    if not t or not t.is_running:
+        return None
+    ep = t.stats.get("endpoint", "")
+    return ep.rsplit(":", 1)[0].strip("[]") if ep else None
 
 
 def parse_endpoint_host(conf_text: str) -> Optional[str]:
