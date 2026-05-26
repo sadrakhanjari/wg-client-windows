@@ -92,9 +92,42 @@ def set_dns(adapter_name: str, servers: list[str]) -> None:
                    f"name={adapter_name}", s, f"index={i}", "validate=no")
 
 
+def get_dns(adapter_name: str) -> list[str]:
+    """Return DNS servers currently configured on the adapter (v4 then v6).
+
+    Empty list means automatic/DHCP (no static DNS). The netsh label text is
+    localized, but IP tokens are universal, so we just scan each line for
+    parseable addresses rather than matching the (translated) heading.
+    """
+    servers: list[str] = []
+    for fam in ("ipv4", "ipv6"):
+        r = subprocess.run(
+            ["netsh", "interface", fam, "show", "dnsservers",
+             f"name={adapter_name}"],
+            capture_output=True, text=True, creationflags=_NO_WIN,
+        )
+        for line in r.stdout.splitlines():
+            for tok in line.split():
+                tok = tok.strip()
+                try:
+                    ipaddress.ip_address(tok)
+                except ValueError:
+                    continue
+                if tok not in servers:
+                    servers.append(tok)
+    return servers
+
+
 def add_route(adapter_name: str, dest_cidr: str, metric: int = 1) -> None:
     net = ipaddress.ip_network(dest_cidr, strict=False)
     family = "ipv4" if net.version == 4 else "ipv6"
+    # Idempotent: drop any leftover route for this prefix on the adapter before
+    # re-adding (stale store=active route from a session that wasn't cleaned up).
+    _netsh(
+        "interface", family, "delete", "route",
+        f"prefix={net.with_prefixlen}",
+        f"interface={adapter_name}",
+    )
     rc, out = _netsh(
         "interface", family, "add", "route",
         f"prefix={net.with_prefixlen}",
@@ -125,9 +158,19 @@ def add_route_via(dest_cidr: str, gateway: str, interface: str,
     netsh `add route` REQUIRES `interface=`; without it netsh prints
     "One or more essential parameters were not entered" yet still exits 0,
     so we must validate the textual output, not just the return code.
+
+    Idempotent: a prior session that crashed without cleanup (or a stale
+    store=active route from before a reboot) leaves the prefix in the table,
+    so netsh would fail with "The object already exists". Delete first so the
+    re-add always reflects the current gateway/interface.
     """
     net = ipaddress.ip_network(dest_cidr, strict=False)
     family = "ipv4" if net.version == 4 else "ipv6"
+    _netsh(
+        "interface", family, "delete", "route",
+        f"prefix={net.with_prefixlen}",
+        f"interface={interface}",
+    )
     rc, out = _netsh(
         "interface", family, "add", "route",
         f"prefix={net.with_prefixlen}",

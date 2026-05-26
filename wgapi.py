@@ -20,6 +20,7 @@ Public API (kept compatible with main.py from Phase 0):
 """
 import os
 import re
+import sys
 import ctypes
 import threading
 from pathlib import Path
@@ -31,9 +32,16 @@ import tunnel as _tun
 CONF_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "LocalWireGuard" / "tunnels"
 CONF_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def _base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return Path(__file__).resolve().parent
+
+
 # Sentinel for backward-compat with main.py — Phase 0 checked this path.
 # We point to wintun.dll which is our actual runtime dependency.
-WG_EXE = Path(__file__).resolve().parent / "vendor" / "wintun.dll"
+WG_EXE = _base_dir() / "vendor" / "wintun.dll"
 
 _lock = threading.Lock()
 _active: dict[str, _tun.Tunnel] = {}
@@ -220,6 +228,20 @@ def set_dns(name: str, servers: list[str]) -> tuple[bool, str]:
         return True, "ok"
     except Exception as e:
         return False, str(e)
+
+
+def get_dns(name: str) -> Optional[list[str]]:
+    """DNS servers currently set on the active tunnel's adapter, or None if the
+    tunnel isn't running. Empty list means automatic/DHCP."""
+    with _lock:
+        t = _active.get(name)
+    if not t or not t.is_running:
+        return None
+    try:
+        import netcfg
+        return netcfg.get_dns(name)
+    except Exception:
+        return None
 
 
 def get_endpoint_ip(name: str) -> Optional[str]:

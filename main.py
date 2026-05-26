@@ -1,12 +1,15 @@
+import os
 import sys
 import json
 import time
 import socket
+import struct
 import ctypes
 import threading
 import subprocess
 import urllib.request
 from pathlib import Path
+import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
@@ -111,6 +114,120 @@ def ping_ms(host: str, timeout_ms: int = 1200) -> float:
         return -1.0
 
 
+def ping_stats(host: str, count: int = 5, timeout_ms: int = 1000) -> tuple[float, float]:
+    """Run `count` ICMP pings; return (avg_latency_ms, loss_pct).
+
+    avg is -1 if every probe was lost / the host didn't resolve. Loss is derived
+    from how many replies we actually saw (locale-proof — we count `time=` reply
+    lines instead of parsing the localized 'Lost = N' summary)."""
+    try:
+        ip = socket.gethostbyname(host)
+    except Exception:
+        return -1.0, 100.0
+    try:
+        r = subprocess.run(
+            ["ping", "-n", str(count), "-w", str(timeout_ms), ip],
+            capture_output=True, text=True,
+            timeout=count * (timeout_ms / 1000.0) + 5,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except Exception:
+        return -1.0, 100.0
+    times: list[float] = []
+    for line in r.stdout.splitlines():
+        low = line.lower()
+        if "time=" in low or "time<" in low:
+            seg = low.split("time")[1][1:]
+            num = ""
+            for ch in seg:
+                if ch.isdigit() or ch == ".":
+                    num += ch
+                elif num:
+                    break
+            if num:
+                times.append(float(num))
+    recv = len(times)
+    loss = 100.0 * (count - recv) / count if count else 100.0
+    avg = sum(times) / len(times) if times else -1.0
+    return avg, loss
+
+
+_DNS_TEST_NAMES = ("example.com", "wikipedia.org", "github.com", "cloudflare.com")
+
+
+def dns_query_ms(server: str, qname: str = "example.com",
+                 timeout: float = 1.5) -> float:
+    """Send one A-record DNS query over UDP/53 to `server`; return RTT in ms,
+    or -1 on timeout/refusal. Pure socket — no external resolver libs."""
+    tid = os.urandom(2)
+    header = tid + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+    qname_bytes = b"".join(
+        bytes([len(p)]) + p.encode("idna" if any(ord(c) > 127 for c in p) else "ascii")
+        for p in qname.split(".") if p) + b"\x00"
+    packet = header + qname_bytes + struct.pack(">HH", 1, 1)  # type A, class IN
+    fam = socket.AF_INET6 if ":" in server else socket.AF_INET
+    s = socket.socket(fam, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        t0 = time.perf_counter()
+        s.sendto(packet, (server, 53))
+        data, _ = s.recvfrom(1500)
+        if len(data) < 4 or data[:2] != tid:
+            return -1.0
+        return (time.perf_counter() - t0) * 1000.0
+    except Exception:
+        return -1.0
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def probe_dns(server: str, queries: int = 4) -> dict:
+    """Full health probe of one resolver: ICMP latency + loss, plus real DNS
+    query RTT + DNS loss. Produces a single `score` (lower = better) used to
+    rank servers, and `ok` if it answers DNS at all.
+
+    score = dns_rtt + dns_loss%*5   (DNS that actually resolves is what matters);
+    if DNS never answers we fall back to ICMP with a heavy penalty so a pingable-
+    but-not-resolving box always sorts below a working resolver."""
+    ping_avg, ping_loss = ping_stats(server, count=5)
+    rtts: list[float] = []
+    for i in range(queries):
+        ms = dns_query_ms(server, _DNS_TEST_NAMES[i % len(_DNS_TEST_NAMES)])
+        if ms >= 0:
+            rtts.append(ms)
+    dns_recv = len(rtts)
+    dns_loss = 100.0 * (queries - dns_recv) / queries if queries else 100.0
+    dns_rtt = sum(rtts) / len(rtts) if rtts else -1.0
+    ok = dns_rtt >= 0
+    if ok:
+        score = dns_rtt + dns_loss * 5.0
+    elif ping_avg >= 0:
+        score = 2000.0 + ping_avg + ping_loss * 5.0
+    else:
+        score = float("inf")
+    return {
+        "server": server, "ok": ok, "score": score,
+        "ping_ms": ping_avg, "ping_loss": ping_loss,
+        "dns_ms": dns_rtt, "dns_loss": dns_loss,
+    }
+
+
+def score_color(score: float) -> str:
+    """Quality color for a probe score (lower = better)."""
+    if score == float("inf"):
+        return COLOR_DANGER
+    if score < 60:
+        return "#22c55e"     # excellent
+    if score < 140:
+        return "#84cc16"     # good
+    if score < 300:
+        return "#f59e0b"     # ok
+    return "#f97316"         # poor
+
+
 def lookup_country(ip: str) -> tuple[str, str]:
     """(country_name, country_code) for an IP. Tries HTTPS ipwho.is first,
     then HTTP ip-api.com. Runs through the active tunnel, so it can fail if the
@@ -150,6 +267,163 @@ def build_tray_image(active: bool, up_on: bool, down_on: bool):
     # download arrow (bottom half, pointing down)
     d.polygon([(32, 59), (53, 38), (39, 38), (39, 34), (25, 34), (25, 38), (11, 38)], fill=dn)
     return img
+
+
+HUD_BG = "#0d0e11"
+
+
+class OverlayHUD:
+    """Borderless, always-on-top, click-through HUD pinned to a screen corner,
+    showing live download/upload/ping (+ optional mini speed graph)."""
+
+    def __init__(self, master, prefs, value_provider):
+        self.master = master
+        self.prefs = prefs
+        self.provider = value_provider     # () -> {active, down, up, ping}
+        self.win: tk.Toplevel | None = None
+        self._after = None
+        self._down_hist: list[float] = []
+        self._up_hist: list[float] = []
+        self._build()
+
+    def _build(self):
+        p = self.prefs
+        self.win = tk.Toplevel(self.master)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        try:
+            self.win.attributes("-alpha", p.opacity)
+        except Exception:
+            pass
+        self.win.configure(bg=HUD_BG)
+        self.frame = tk.Frame(self.win, bg=HUD_BG)
+        self.frame.pack(fill="both", expand=True, padx=p.padding, pady=p.padding)
+        self.labels = {}
+        for key in ("down", "up", "ping"):
+            self.labels[key] = tk.Label(
+                self.frame, text="", bg=HUD_BG, fg=p.color, width=13,
+                font=(p.font_family, p.font_size, "bold"), anchor="w", justify="left")
+        self.canvas = tk.Canvas(self.frame, bg=HUD_BG, highlightthickness=0,
+                                height=42, width=p.font_size * 11)
+        self._layout_items()
+        self.win.update_idletasks()
+        self._reposition()
+        self._make_clickthrough()
+        self._tick()
+
+    def _layout_items(self):
+        for w in list(self.labels.values()) + [self.canvas]:
+            w.pack_forget()
+        p = self.prefs
+        order = []
+        if p.show_download:
+            order.append("down")
+        if p.show_upload:
+            order.append("up")
+        if p.show_ping:
+            order.append("ping")
+        for i, key in enumerate(order):
+            self.labels[key].pack(anchor="w", pady=(0 if i == 0 else p.spacing, 0))
+        if p.show_graph:
+            self.canvas.pack(anchor="w", pady=(p.spacing if order else 0, 0))
+
+    def _make_clickthrough(self):
+        try:
+            import ctypes
+            GWL_EXSTYLE = -20
+            WS_EX_LAYERED = 0x80000
+            WS_EX_TRANSPARENT = 0x20
+            WS_EX_TOOLWINDOW = 0x80
+            LWA_ALPHA = 0x2
+            u = ctypes.windll.user32
+            hwnd = self.win.winfo_id()
+            cur = u.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            u.SetWindowLongW(
+                hwnd, GWL_EXSTYLE,
+                cur | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW)
+            # Changing the ex-style on a WS_EX_LAYERED window wipes the alpha
+            # Tk set via -alpha; without re-asserting it the window has no valid
+            # layered attributes and DWM paints it as a solid black box. Set it
+            # again so the HUD actually composites onto the screen.
+            alpha = max(0, min(255, int(self.prefs.opacity * 255)))
+            u.SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA)
+        except Exception:
+            pass
+
+    def _reposition(self):
+        if not self.win:
+            return
+        self.win.update_idletasks()
+        w = self.win.winfo_reqwidth()
+        h = self.win.winfo_reqheight()
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        m = self.prefs.margin
+        pos = self.prefs.position
+        x = m if "left" in pos else max(0, sw - w - m)
+        y = m if "top" in pos else max(0, sh - h - m)
+        self.win.geometry(f"+{x}+{y}")
+
+    def _push_graph(self, down, up):
+        n = 60
+        self._down_hist.append(down)
+        self._up_hist.append(up)
+        self._down_hist = self._down_hist[-n:]
+        self._up_hist = self._up_hist[-n:]
+
+    def _draw_graph(self):
+        c = self.canvas
+        c.delete("all")
+        W = c.winfo_width() or c.winfo_reqwidth()
+        H = c.winfo_height() or 42
+        mx = max(self._down_hist + self._up_hist + [1.0])
+
+        def line(hist, col):
+            if len(hist) < 2:
+                return
+            step = W / max(1, len(hist) - 1)
+            pts = []
+            for i, val in enumerate(hist):
+                pts += [i * step, H - (val / mx) * (H - 2) - 1]
+            c.create_line(*pts, fill=col, width=1)
+
+        line(self._down_hist, self.prefs.color)
+        line(self._up_hist, "#7a7d85")
+
+    def _tick(self):
+        if not self.win:
+            return
+        try:
+            v = self.provider() or {}
+            active = bool(v.get("active"))
+            down, up, ping = v.get("down", 0.0), v.get("up", 0.0), v.get("ping", -1.0)
+            self.labels["down"].configure(text=f"↓ {fmt_rate(down)}" if active else "↓  —")
+            self.labels["up"].configure(text=f"↑ {fmt_rate(up)}" if active else "↑  —")
+            self.labels["ping"].configure(
+                text=f"⏱ {ping:.0f} ms" if (active and ping >= 0) else "⏱  —")
+            if self.prefs.show_graph:
+                self._push_graph(down if active else 0.0, up if active else 0.0)
+                self._draw_graph()
+            # keep it glued to the top of the z-order and pinned to its corner
+            self.win.attributes("-topmost", True)
+            self._reposition()
+        except Exception:
+            pass
+        self._after = self.master.after(self.prefs.refresh_ms, self._tick)
+
+    def destroy(self):
+        if self._after:
+            try:
+                self.master.after_cancel(self._after)
+            except Exception:
+                pass
+            self._after = None
+        if self.win:
+            try:
+                self.win.destroy()
+            except Exception:
+                pass
+            self.win = None
 
 
 class StatsPoller(threading.Thread):
@@ -385,10 +659,15 @@ class SettingsDialog(ctk.CTkToplevel):
         ctk.CTkCheckBox(self, text="System tray icon (applies after restart)",
                         variable=self.tray_var, fg_color=COLOR_PRIMARY,
                         hover_color=COLOR_PRIMARY_HOVER).pack(anchor="w", padx=24, pady=3)
-        ctk.CTkButton(self, text="Manage DNS list…", width=160, height=30,
+        rowf = ctk.CTkFrame(self, fg_color="transparent")
+        rowf.pack(anchor="w", padx=24, pady=(8, 0))
+        ctk.CTkButton(rowf, text="Manage DNS list…", width=160, height=30,
                       fg_color=COLOR_SEL, hover_color=COLOR_HOVER,
-                      command=lambda: DnsManagerDialog(self)).pack(
-            anchor="w", padx=24, pady=(8, 0))
+                      command=lambda: DnsManagerDialog(self)).pack(side="left")
+        ctk.CTkButton(rowf, text="Overlay (HUD)…", width=140, height=30,
+                      fg_color=COLOR_SEL, hover_color=COLOR_HOVER,
+                      command=lambda: OverlayDialog(self, self.master)).pack(
+            side="left", padx=(8, 0))
 
         # --- Appearance (applies on restart) ---
         ctk.CTkLabel(self, text="Appearance  (applies on restart)",
@@ -396,25 +675,40 @@ class SettingsDialog(ctk.CTkToplevel):
             fill="x", padx=24, pady=(16, 4))
         appr = ctk.CTkFrame(self, fg_color="transparent")
         appr.pack(fill="x", padx=24)
-        ctk.CTkLabel(appr, text="Font").grid(row=0, column=0, sticky="w", pady=6)
-        self.font_var = ctk.StringVar(value=ui.font_family)
-        ctk.CTkOptionMenu(appr, variable=self.font_var,
-                          values=appsettings.FONT_CHOICES, width=240,
-                          fg_color=COLOR_SEL, button_color=COLOR_SEL,
-                          button_hover_color=COLOR_HOVER,
-                          dropdown_fg_color=COLOR_PANEL).grid(
-            row=0, column=1, sticky="w", padx=8, pady=6)
-        ctk.CTkLabel(appr, text="Accent color").grid(row=1, column=0, sticky="w", pady=6)
+        appr.grid_columnconfigure(1, weight=1)
         self._accent_map = {n: c for n, c in appsettings.ACCENT_CHOICES}
         cur_accent = next((n for n, c in appsettings.ACCENT_CHOICES if c == ui.accent),
                           appsettings.ACCENT_CHOICES[0][0])
+
+        ctk.CTkLabel(appr, text="Font").grid(row=0, column=0, sticky="w", pady=6)
+        self.font_var = ctk.StringVar(value=ui.font_family)
+        ctk.CTkOptionMenu(appr, variable=self.font_var,
+                          values=appsettings.FONT_CHOICES, width=200,
+                          command=self._preview, fg_color=COLOR_SEL,
+                          button_color=COLOR_SEL, button_hover_color=COLOR_HOVER,
+                          dropdown_fg_color=COLOR_PANEL).grid(
+            row=0, column=1, sticky="ew", padx=8, pady=6)
+        ctk.CTkLabel(appr, text="Accent color").grid(row=1, column=0, sticky="w", pady=6)
         self.accent_var = ctk.StringVar(value=cur_accent)
         ctk.CTkOptionMenu(appr, variable=self.accent_var,
-                          values=[n for n, _ in appsettings.ACCENT_CHOICES], width=240,
-                          fg_color=COLOR_SEL, button_color=COLOR_SEL,
-                          button_hover_color=COLOR_HOVER,
+                          values=[n for n, _ in appsettings.ACCENT_CHOICES], width=200,
+                          command=self._preview, fg_color=COLOR_SEL,
+                          button_color=COLOR_SEL, button_hover_color=COLOR_HOVER,
                           dropdown_fg_color=COLOR_PANEL).grid(
-            row=1, column=1, sticky="w", padx=8, pady=6)
+            row=1, column=1, sticky="ew", padx=8, pady=6)
+        self.accent_swatch = ctk.CTkLabel(appr, text="", width=28, height=22,
+                                          corner_radius=5, fg_color=ui.accent)
+        self.accent_swatch.grid(row=1, column=2, padx=(2, 0))
+
+        # live preview of the chosen font + color
+        prev = ctk.CTkFrame(self, fg_color=COLOR_PANEL, corner_radius=8)
+        prev.pack(fill="x", padx=24, pady=(8, 0))
+        ctk.CTkLabel(prev, text="Preview", text_color=COLOR_MUTED,
+                     font=(FONT_FAMILY, 10, "bold")).pack(anchor="w", padx=12, pady=(8, 0))
+        self.font_sample = ctk.CTkLabel(
+            prev, text="The quick brown fox  AaBbCc 0123  •  نمونه فارسی",
+            font=(ui.font_family, 16, "bold"), text_color=ui.accent, anchor="w")
+        self.font_sample.pack(fill="x", padx=12, pady=(2, 10))
 
         btns = ctk.CTkFrame(self, fg_color="transparent")
         btns.pack(fill="x", padx=24, pady=(18, 16), side="bottom")
@@ -460,6 +754,15 @@ class SettingsDialog(ctk.CTkToplevel):
         appsettings.set_ui(ui)
         self.result_saved = True
         self.destroy()
+
+    def _preview(self, _=None):
+        col = self._accent_map.get(self.accent_var.get(), COLOR_PRIMARY)
+        try:
+            self.font_sample.configure(font=(self.font_var.get(), 16, "bold"),
+                                       text_color=col)
+            self.accent_swatch.configure(fg_color=col)
+        except Exception:
+            pass
 
 
 class DnsManagerDialog(ctk.CTkToplevel):
@@ -533,6 +836,265 @@ class DnsManagerDialog(ctk.CTkToplevel):
         appsettings.save_dns_catalog(entries)
         self.changed = True
         self.destroy()
+
+
+class DnsTestDialog(ctk.CTkToplevel):
+    """Probe every enabled resolver (latency, packet loss, DNS query RTT/loss),
+    rank best-first, and let the user pick one to use."""
+
+    def __init__(self, parent, entries):
+        super().__init__(parent)
+        self.title("DNS test")
+        self.geometry("680x560")
+        self.configure(fg_color=COLOR_BG)
+        self.transient(parent)
+        self.grab_set()
+        self.entries = entries
+        self.results: list[dict] = []     # filled when probing finishes
+        self.chosen: str | None = None    # name the user clicked "Use" on
+        self._rows: dict[str, dict] = {}  # name -> widgets
+        self._done = 0
+
+        ctk.CTkLabel(self, text="DNS test", font=(FONT_FAMILY, 16, "bold"),
+                     anchor="w").pack(fill="x", padx=20, pady=(18, 2))
+        self.subtitle = ctk.CTkLabel(
+            self, text=f"Probing {len(entries)} servers — ping loss, latency & "
+                       f"DNS query time. Best first.",
+            text_color=COLOR_MUTED, anchor="w")
+        self.subtitle.pack(fill="x", padx=20, pady=(0, 8))
+
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=22)
+        cols = [("Server", 150, "w"), ("DNS", 95, "e"), ("DNS loss", 80, "e"),
+                ("Ping", 80, "e"), ("Loss", 70, "e"), ("Score", 70, "e"),
+                ("", 60, "e")]
+        for txt, w, anchor in cols:
+            ctk.CTkLabel(header, text=txt, width=w, anchor=anchor,
+                         text_color=COLOR_MUTED,
+                         font=(FONT_FAMILY, 10, "bold")).pack(side="left", padx=2)
+
+        self.scroll = ctk.CTkScrollableFrame(self, fg_color=COLOR_PANEL)
+        self.scroll.pack(fill="both", expand=True, padx=20, pady=(4, 8))
+        for e in entries:
+            self._make_row(e)
+
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.pack(fill="x", padx=20, pady=(0, 16))
+        self.retest_btn = ctk.CTkButton(btns, text="Re-test", width=100,
+                                        fg_color=COLOR_SEL, hover_color=COLOR_HOVER,
+                                        command=self._start, state="disabled")
+        self.retest_btn.pack(side="left")
+        ctk.CTkButton(btns, text="Close", width=90, fg_color=COLOR_SEL,
+                      hover_color=COLOR_HOVER, command=self.destroy).pack(side="right")
+        self.bind("<Escape>", lambda e: self.destroy())
+        self._start()
+
+    def _make_row(self, entry):
+        row = ctk.CTkFrame(self.scroll, fg_color="transparent")
+        row.pack(fill="x", pady=2)
+        server = entry.servers[0]
+        name_lbl = ctk.CTkLabel(row, text=entry.name, width=150, anchor="w",
+                                font=(FONT_FAMILY, 12))
+        name_lbl.pack(side="left", padx=2)
+        dns_lbl = ctk.CTkLabel(row, text="…", width=95, anchor="e", text_color=COLOR_MUTED)
+        dns_lbl.pack(side="left", padx=2)
+        dloss_lbl = ctk.CTkLabel(row, text="", width=80, anchor="e", text_color=COLOR_MUTED)
+        dloss_lbl.pack(side="left", padx=2)
+        ping_lbl = ctk.CTkLabel(row, text="", width=80, anchor="e", text_color=COLOR_MUTED)
+        ping_lbl.pack(side="left", padx=2)
+        loss_lbl = ctk.CTkLabel(row, text="", width=70, anchor="e", text_color=COLOR_MUTED)
+        loss_lbl.pack(side="left", padx=2)
+        score_lbl = ctk.CTkLabel(row, text="", width=70, anchor="e",
+                                 font=(FONT_FAMILY, 12, "bold"))
+        score_lbl.pack(side="left", padx=2)
+        use_btn = ctk.CTkButton(row, text="Use", width=56, height=26,
+                                fg_color=COLOR_SEL, hover_color=COLOR_HOVER,
+                                command=lambda n=entry.name: self._use(n))
+        use_btn.pack(side="left", padx=2)
+        self._rows[entry.name] = {
+            "row": row, "server": server, "dns": dns_lbl, "dloss": dloss_lbl,
+            "ping": ping_lbl, "loss": loss_lbl, "score": score_lbl, "use": use_btn,
+        }
+
+    def _start(self):
+        self._done = 0
+        self.results = []
+        self.retest_btn.configure(state="disabled")
+        for w in self._rows.values():
+            w["dns"].configure(text="…", text_color=COLOR_MUTED)
+            for k in ("dloss", "ping", "loss", "score"):
+                w[k].configure(text="")
+        import concurrent.futures as cf
+
+        def work():
+            with cf.ThreadPoolExecutor(max_workers=12) as ex:
+                futs = {ex.submit(probe_dns, w["server"]): n
+                        for n, w in self._rows.items()}
+                for fut in cf.as_completed(futs):
+                    nm = futs[fut]
+                    try:
+                        res = fut.result()
+                    except Exception:
+                        res = {"server": self._rows[nm]["server"], "ok": False,
+                               "score": float("inf"), "ping_ms": -1, "ping_loss": 100,
+                               "dns_ms": -1, "dns_loss": 100}
+                    res["name"] = nm
+                    self.after(0, lambda r=res: self._row_done(r))
+            self.after(0, self._all_done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _row_done(self, res: dict):
+        try:
+            w = self._rows[res["name"]]
+        except KeyError:
+            return
+        self.results.append(res)
+        dns_ms, dns_loss = res["dns_ms"], res["dns_loss"]
+        ping_ms_v, ping_loss = res["ping_ms"], res["ping_loss"]
+        w["dns"].configure(
+            text=f"{dns_ms:.0f} ms" if dns_ms >= 0 else "fail",
+            text_color=COLOR_TEXT if dns_ms >= 0 else COLOR_DANGER)
+        w["dloss"].configure(text=f"{dns_loss:.0f}%",
+                             text_color=COLOR_DANGER if dns_loss > 0 else COLOR_MUTED)
+        w["ping"].configure(text=f"{ping_ms_v:.0f} ms" if ping_ms_v >= 0 else "—")
+        w["loss"].configure(text=f"{ping_loss:.0f}%",
+                            text_color=COLOR_DANGER if ping_loss > 0 else COLOR_MUTED)
+        sc = res["score"]
+        w["score"].configure(
+            text="∞" if sc == float("inf") else f"{sc:.0f}",
+            text_color=score_color(sc))
+        self._done += 1
+        self.subtitle.configure(
+            text=f"Tested {self._done}/{len(self._rows)} — lower score is better.")
+
+    def _all_done(self):
+        self.retest_btn.configure(state="normal")
+        # Re-order rows best-first.
+        order = sorted(self._rows.keys(),
+                       key=lambda n: next((r["score"] for r in self.results
+                                           if r["name"] == n), float("inf")))
+        for i, n in enumerate(order):
+            w = self._rows[n]
+            w["row"].pack_forget()
+            w["row"].pack(fill="x", pady=2)
+            # highlight the winner
+            best = (i == 0)
+            w["use"].configure(
+                fg_color=COLOR_PRIMARY if best else COLOR_SEL,
+                hover_color=COLOR_PRIMARY_HOVER if best else COLOR_HOVER)
+        self.subtitle.configure(
+            text=f"Done — {len(self.results)} tested. Best on top. "
+                 f"Click Use to apply.")
+
+    def _use(self, name: str):
+        self.chosen = name
+        self.destroy()
+
+
+class OverlayDialog(ctk.CTkToplevel):
+    """Configure the on-screen HUD. Changes apply live (the HUD is its own preview)."""
+    POSITIONS = ["top-left", "top-right", "bottom-left", "bottom-right"]
+    COLORS = appsettings.ACCENT_CHOICES + [("Lime", "#4ade80"), ("White", "#ffffff")]
+
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.title("Overlay (HUD)")
+        self.geometry("480x700")
+        self.configure(fg_color=COLOR_BG)
+        self.transient(parent)
+        self.grab_set()
+        self.app = app
+        self._color_map = {n: c for n, c in self.COLORS}
+        ov = appsettings.get_overlay()
+
+        body = ctk.CTkScrollableFrame(self, fg_color=COLOR_BG)
+        body.pack(fill="both", expand=True, padx=12, pady=12)
+
+        self.enabled_var = ctk.BooleanVar(value=ov.enabled)
+        ctk.CTkCheckBox(body, text="Show on-screen overlay (always on top)",
+                        variable=self.enabled_var, fg_color=COLOR_PRIMARY,
+                        hover_color=COLOR_PRIMARY_HOVER).pack(anchor="w", pady=(4, 10))
+
+        ctk.CTkLabel(body, text="Items to show", font=(FONT_FAMILY, 13, "bold"),
+                     anchor="w").pack(fill="x")
+        self.dl_var = ctk.BooleanVar(value=ov.show_download)
+        self.ul_var = ctk.BooleanVar(value=ov.show_upload)
+        self.ping_var = ctk.BooleanVar(value=ov.show_ping)
+        self.graph_var = ctk.BooleanVar(value=ov.show_graph)
+        for txt, var in (("Download", self.dl_var), ("Upload", self.ul_var),
+                         ("Ping", self.ping_var),
+                         ("Monitoring signal (speed graph)", self.graph_var)):
+            ctk.CTkCheckBox(body, text=txt, variable=var, fg_color=COLOR_PRIMARY,
+                            hover_color=COLOR_PRIMARY_HOVER).pack(anchor="w", pady=2)
+
+        grid = ctk.CTkFrame(body, fg_color="transparent")
+        grid.pack(fill="x", pady=(10, 0))
+        grid.grid_columnconfigure(1, weight=1)
+        self._row = 0
+
+        cur_color = next((n for n, c in self.COLORS if c == ov.color), "Lime")
+        self.pos_var = self._menu(grid, "Position", self.POSITIONS, ov.position)
+        self.font_var = self._menu(grid, "Font", appsettings.FONT_CHOICES, ov.font_family)
+        self.color_var = self._menu(grid, "Color", [n for n, _ in self.COLORS], cur_color)
+        self.size_var = self._menu(grid, "Text size",
+                                   ["10", "11", "12", "13", "14", "16", "18", "20", "24"],
+                                   str(ov.font_size))
+        self.opacity_var = self._menu(grid, "Opacity",
+                                      ["0.4", "0.5", "0.6", "0.7", "0.8", "0.9", "1.0"],
+                                      f"{ov.opacity:.1f}")
+        self.pad_var = self._menu(grid, "Box padding",
+                                  ["4", "8", "12", "16", "20", "28"], str(ov.padding))
+        self.spc_var = self._menu(grid, "Item spacing",
+                                  ["0", "2", "4", "6", "8", "12"], str(ov.spacing))
+        self.margin_var = self._menu(grid, "Edge margin",
+                                     ["0", "12", "24", "40", "60", "100"], str(ov.margin))
+        self.refresh_var = self._menu(grid, "Refresh (ms)",
+                                      ["100", "250", "500", "1000", "2000"],
+                                      str(ov.refresh_ms))
+
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.pack(fill="x", padx=16, pady=(0, 14))
+        ctk.CTkButton(btns, text="Apply", width=110, fg_color=COLOR_PRIMARY,
+                      hover_color=COLOR_PRIMARY_HOVER, command=self._save).pack(side="right")
+        ctk.CTkButton(btns, text="Close", width=90, fg_color=COLOR_SEL,
+                      hover_color=COLOR_HOVER, command=self.destroy).pack(
+            side="right", padx=(0, 8))
+        self.bind("<Escape>", lambda e: self.destroy())
+
+    def _menu(self, grid, label, values, current):
+        ctk.CTkLabel(grid, text=label).grid(row=self._row, column=0, sticky="w", pady=5)
+        var = ctk.StringVar(value=current)
+        ctk.CTkOptionMenu(grid, variable=var, values=values, width=200,
+                          fg_color=COLOR_SEL, button_color=COLOR_SEL,
+                          button_hover_color=COLOR_HOVER,
+                          dropdown_fg_color=COLOR_PANEL).grid(
+            row=self._row, column=1, sticky="e", padx=8, pady=5)
+        self._row += 1
+        return var
+
+    def _save(self):
+        ov = appsettings.OverlayPrefs(
+            enabled=self.enabled_var.get(),
+            position=self.pos_var.get(),
+            show_download=self.dl_var.get(),
+            show_upload=self.ul_var.get(),
+            show_ping=self.ping_var.get(),
+            show_graph=self.graph_var.get(),
+            font_family=self.font_var.get(),
+            font_size=int(self.size_var.get()),
+            color=self._color_map.get(self.color_var.get(), "#4ade80"),
+            opacity=float(self.opacity_var.get()),
+            padding=int(self.pad_var.get()),
+            spacing=int(self.spc_var.get()),
+            margin=int(self.margin_var.get()),
+            refresh_ms=int(self.refresh_var.get()),
+        )
+        appsettings.set_overlay(ov)
+        try:
+            self.app._reload_overlay()
+        except Exception:
+            pass
 
 
 class SplitConfigDialog(ctk.CTkToplevel):
@@ -635,11 +1197,18 @@ class App(ctk.CTk):
         self._sidebar_cur = 0 if self._sidebar_collapsed else self._sidebar_width
         # DNS selector state
         self._dns_label_to_name: dict[str, str] = {}
-        self._dns_ping: dict[str, float] = {}
-        self._dns_test_thread: threading.Thread | None = None
+        self._dns_ping: dict[str, float] = {}       # name -> DNS query rtt (ms)
+        self._dns_score: dict[str, float] = {}      # name -> probe score (rank)
+        self._dns_status_shown: str | None = None   # last rendered status string
+        self._dns_status_last: float = 0.0          # throttle adapter DNS reads
+        self._dns_status_busy: bool = False
         # tray
         self._tray = None
         self._tray_state = None
+        # overlay HUD + latest values it reads
+        self._overlay = None
+        self._ov = appsettings.get_overlay()
+        self._hud = {"active": False, "down": 0.0, "up": 0.0, "ping": -1.0}
 
         ctk.set_appearance_mode("dark")
         self._build()
@@ -649,6 +1218,8 @@ class App(ctk.CTk):
             self.side.grid_remove()
             self._side_visible = False
         self._setup_tray()
+        if self._ov.enabled:
+            self._create_overlay()
 
         self.poller = StatsPoller()
         self.poller.start()
@@ -730,24 +1301,46 @@ class App(ctk.CTk):
         self.split_btn.pack(side="left", padx=(8, 0))
 
         dns_bar = ctk.CTkFrame(self.detail, fg_color=COLOR_PANEL, corner_radius=10)
-        dns_bar.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(dns_bar, text="DNS", text_color=COLOR_MUTED,
-                     font=(FONT_FAMILY, 10, "bold"), width=44, anchor="w").grid(
-            row=0, column=0, sticky="w", padx=(14, 6), pady=10)
+        dns_bar.grid_columnconfigure(0, weight=1)
+
+        statrow = ctk.CTkFrame(dns_bar, fg_color="transparent")
+        statrow.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 2))
+        ctk.CTkLabel(statrow, text="DNS", text_color=COLOR_MUTED,
+                     font=(FONT_FAMILY, 10, "bold")).pack(side="left")
+        self.dns_status_dot = ctk.CTkLabel(statrow, text="●", text_color=COLOR_MUTED,
+                                            font=(FONT_FAMILY, 14))
+        self.dns_status_dot.pack(side="left", padx=(10, 5))
+        self.dns_status_lbl = ctk.CTkLabel(statrow, text="—", text_color=COLOR_TEXT,
+                                           font=(FONT_FAMILY, 12), anchor="w")
+        self.dns_status_lbl.pack(side="left", fill="x", expand=True)
+
+        ctrl = ctk.CTkFrame(dns_bar, fg_color="transparent")
+        ctrl.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 10))
+        ctrl.grid_columnconfigure(0, weight=1)
         self.dns_var = ctk.StringVar(value="Default")
         self.dns_menu = ctk.CTkOptionMenu(
-            dns_bar, variable=self.dns_var, values=["Default"],
-            command=self._on_dns_select, width=220,
+            ctrl, variable=self.dns_var, values=["Default"],
+            command=self._on_dns_select,
             fg_color=COLOR_SEL, button_color=COLOR_SEL,
             button_hover_color=COLOR_HOVER, dropdown_fg_color=COLOR_PANEL)
-        self.dns_menu.grid(row=0, column=1, sticky="w", pady=10)
+        self.dns_menu.grid(row=0, column=0, sticky="ew", padx=(4, 6))
+        self.dns_apply_btn = ctk.CTkButton(
+            ctrl, text="Set", width=58, height=28,
+            fg_color=COLOR_PRIMARY, hover_color=COLOR_PRIMARY_HOVER,
+            command=self._on_dns_apply)
+        self.dns_apply_btn.grid(row=0, column=1, padx=3)
+        self.dns_reset_btn = ctk.CTkButton(
+            ctrl, text="Unset", width=64, height=28,
+            fg_color=COLOR_SEL, hover_color=COLOR_HOVER,
+            command=self._on_dns_reset)
+        self.dns_reset_btn.grid(row=0, column=2, padx=3)
         self.dns_test_btn = ctk.CTkButton(
-            dns_bar, text="Test ping", width=90, height=28,
+            ctrl, text="Test all", width=76, height=28,
             fg_color=COLOR_SEL, hover_color=COLOR_HOVER, command=self._on_dns_test)
-        self.dns_test_btn.grid(row=0, column=2, padx=6, pady=10)
-        ctk.CTkButton(dns_bar, text="Manage", width=80, height=28,
+        self.dns_test_btn.grid(row=0, column=3, padx=3)
+        ctk.CTkButton(ctrl, text="Manage", width=72, height=28,
                       fg_color=COLOR_SEL, hover_color=COLOR_HOVER,
-                      command=self._open_dns_manager).grid(row=0, column=3, padx=(0, 12), pady=10)
+                      command=self._open_dns_manager).grid(row=0, column=4, padx=(3, 4))
         self.dns_bar = dns_bar
 
         card = ctk.CTkFrame(self.detail, fg_color=COLOR_PANEL, corner_radius=10)
@@ -1026,9 +1619,15 @@ class App(ctk.CTk):
     # --- DNS changer ---
     def _refresh_dns_menu(self):
         entries = appsettings.get_enabled_dns()
-        if self._dns_ping:
-            entries.sort(key=lambda e: self._dns_ping.get(e.name, 1e9)
-                         if self._dns_ping.get(e.name, -1) >= 0 else 1e9)
+        # Rank best-first: by probe score if we have one, else by DNS rtt.
+        if self._dns_score or self._dns_ping:
+            def rank(e):
+                sc = self._dns_score.get(e.name)
+                if sc is not None:
+                    return sc
+                ms = self._dns_ping.get(e.name, -1)
+                return ms if ms >= 0 else 1e9
+            entries.sort(key=rank)
         self._dns_label_to_name = {"Default": ""}
         values = ["Default"]
         for e in entries:
@@ -1053,6 +1652,20 @@ class App(ctk.CTk):
             appsettings.set_selected_dns(self.current, name)
         self._apply_dns_now(name)
 
+    def _on_dns_apply(self):
+        """Re-apply the DNS currently chosen in the dropdown to the live adapter."""
+        name = self._dns_label_to_name.get(self.dns_var.get(), "")
+        if self.current:
+            appsettings.set_selected_dns(self.current, name)
+        self._apply_dns_now(name)
+
+    def _on_dns_reset(self):
+        """Unset custom DNS: revert the adapter to the .conf's DNS (or DHCP)."""
+        if self.current:
+            appsettings.set_selected_dns(self.current, "")
+        self.dns_var.set("Default")
+        self._apply_dns_now("")     # empty => tunnel.set_dns reverts to config/DHCP
+
     def _apply_dns_now(self, dns_name: str):
         if not self.current or not wgapi.is_active(self.current):
             return  # DNS is applied to the live adapter — connect first
@@ -1068,43 +1681,92 @@ class App(ctk.CTk):
             if not ok:
                 self.after(0, lambda: messagebox.showwarning(
                     "DNS", f"Could not set DNS: {msg}", parent=self))
+            else:
+                self.after(400, lambda: self._refresh_dns_status(force=True))
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_dns_test(self):
-        if self._dns_test_thread and self._dns_test_thread.is_alive():
+    def _refresh_dns_status(self, force: bool = False):
+        """Read the DNS actually configured on the live adapter and reflect it
+        in the status line (which server is set right now). Throttled — reading
+        via netsh spawns subprocesses, and the UI ticks twice a second."""
+        if not getattr(self, "dns_status_lbl", None):
             return
+        if not self.current or not wgapi.is_active(self.current):
+            self.dns_status_dot.configure(text_color=COLOR_MUTED)
+            self.dns_status_lbl.configure(text="Connect to set DNS",
+                                          text_color=COLOR_MUTED)
+            self._dns_status_shown = None
+            return
+        now = time.time()
+        if not force and (self._dns_status_busy or now - self._dns_status_last < 3.0):
+            return
+        self._dns_status_last = now
+        self._dns_status_busy = True
+        name = self.current
+
+        def work():
+            try:
+                servers = wgapi.get_dns(name) or []
+            except Exception:
+                servers = []
+            self.after(0, lambda: self._finish_dns_status(name, servers))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_dns_status(self, name: str, servers: list[str]):
+        self._dns_status_busy = False
+        self._render_dns_status(name, servers)
+
+    def _render_dns_status(self, name: str, servers: list[str]):
+        if name != self.current:
+            return
+        key = ",".join(servers)
+        if key == self._dns_status_shown:
+            return
+        self._dns_status_shown = key
+        if not servers:
+            self.dns_status_dot.configure(text_color=COLOR_MUTED)
+            self.dns_status_lbl.configure(text="Automatic (DHCP) — not set",
+                                          text_color=COLOR_MUTED)
+            return
+        # Map the live servers back to a catalog name, if any matches.
+        label = ""
+        sset = set(servers)
+        for e in appsettings.get_dns_catalog():
+            if set(e.servers) & sset:
+                label = e.name
+                break
+        txt = ", ".join(servers)
+        if label:
+            txt += f"   ({label})"
+        self.dns_status_dot.configure(text_color=COLOR_OK)
+        self.dns_status_lbl.configure(text=txt, text_color=COLOR_TEXT)
+
+    def _on_dns_test(self):
         entries = [e for e in appsettings.get_enabled_dns() if e.servers]
         if not entries:
+            messagebox.showinfo("DNS test", "No enabled DNS servers to test.",
+                                parent=self)
             return
-        self.dns_test_btn.configure(text="Testing…", state="disabled")
-        def work():
-            import concurrent.futures as cf
-            with cf.ThreadPoolExecutor(max_workers=10) as ex:
-                futs = {ex.submit(ping_ms, e.servers[0]): e.name for e in entries}
-                for fut in cf.as_completed(futs):
-                    nm = futs[fut]
-                    try:
-                        ms = fut.result()
-                    except Exception:
-                        ms = -1.0
-                    self.after(0, lambda n=nm, m=ms: self._dns_test_one(n, m))
-            self.after(0, self._dns_test_done)
-        self._dns_test_thread = threading.Thread(target=work, daemon=True)
-        self._dns_test_thread.start()
-
-    def _dns_test_one(self, name: str, ms: float):
-        self._dns_ping[name] = ms
-        self._refresh_dns_menu()
-
-    def _dns_test_done(self):
-        self.dns_test_btn.configure(text="Test ping", state="normal")
-        self._refresh_dns_menu()
+        d = DnsTestDialog(self, entries)
+        self.wait_window(d)
+        # Pull the ranking the dialog produced so the home dropdown re-sorts.
+        if d.results:
+            for r in d.results:
+                self._dns_score[r["name"]] = r["score"]
+                self._dns_ping[r["name"]] = r["dns_ms"]
+            self._refresh_dns_menu()
+        if d.chosen is not None:
+            if self.current:
+                appsettings.set_selected_dns(self.current, d.chosen)
+            self._refresh_dns_menu()
+            self._apply_dns_now(d.chosen)
 
     def _open_dns_manager(self):
         d = DnsManagerDialog(self)
         self.wait_window(d)
         if d.changed:
             self._dns_ping.clear()
+            self._dns_score.clear()
             self._refresh_dns_menu()
 
     # --- server geolocation ---
@@ -1181,6 +1843,27 @@ class App(ctk.CTk):
     def _tray_quit(self, icon=None, item=None):
         self.after(0, self._on_close)
 
+    # --- overlay HUD ---
+    def _create_overlay(self):
+        try:
+            self._overlay = OverlayHUD(self, self._ov, lambda: self._hud)
+        except Exception:
+            self._overlay = None
+
+    def _destroy_overlay(self):
+        if self._overlay:
+            try:
+                self._overlay.destroy()
+            except Exception:
+                pass
+            self._overlay = None
+
+    def _reload_overlay(self):
+        self._ov = appsettings.get_overlay()
+        self._destroy_overlay()
+        if self._ov.enabled:
+            self._create_overlay()
+
     # --- tick (reads cached snapshot from poller) ---
     def _tick(self):
         try:
@@ -1211,13 +1894,14 @@ class App(ctk.CTk):
                                            fg_color=COLOR_PRIMARY, hover_color=COLOR_PRIMARY_HOVER)
                 self._reconnect_status = ""
 
-        # DNS controls are usable only while connected (DNS is applied to the
-        # live adapter). Reflect that here.
+        # Set/Unset apply to the live adapter, so they're enabled only while
+        # connected. "Test all" works any time (it probes resolvers directly).
         if self._ui.dns_changer_enabled:
-            testing = bool(self._dns_test_thread and self._dns_test_thread.is_alive())
-            self.dns_menu.configure(state="normal" if active else "disabled")
-            self.dns_test_btn.configure(
-                state="normal" if (active and not testing) else "disabled")
+            live = "normal" if active else "disabled"
+            self.dns_menu.configure(state=live)
+            self.dns_apply_btn.configure(state=live)
+            self.dns_reset_btn.configure(state=live)
+            self._refresh_dns_status()
 
         drx = dtx = 0.0
         if active and stats:
@@ -1286,6 +1970,8 @@ class App(ctk.CTk):
             if getattr(self, "_dns_applied_for", None) == self.current:
                 self._dns_applied_for = None
 
+        self._hud = {"active": active, "down": drx, "up": dtx,
+                     "ping": self.last_ping_ms}
         self._update_tray(active, drx, dtx)
 
     # --- ping ---
@@ -1309,6 +1995,7 @@ class App(ctk.CTk):
     def _on_close(self):
         self._stop_ping()
         self._stop_reconnect_monitor()
+        self._destroy_overlay()
         self.poller.stop()
         if self._tray:
             try:

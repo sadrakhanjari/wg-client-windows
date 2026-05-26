@@ -4,6 +4,7 @@ API reference: vendor/wintun.h (from https://www.wintun.net/).
 The DLL handles driver install on first CreateAdapter call (requires admin).
 """
 import os
+import sys
 import ctypes
 import ctypes.wintypes as wt
 import struct
@@ -12,7 +13,14 @@ from pathlib import Path
 from typing import Optional, Callable
 
 
-_DLL_DIR = Path(__file__).resolve().parent / "vendor"
+def _base_dir() -> Path:
+    # When frozen by PyInstaller, bundled data lives under sys._MEIPASS.
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return Path(__file__).resolve().parent
+
+
+_DLL_DIR = _base_dir() / "vendor"
 _DLL_PATH = _DLL_DIR / "wintun.dll"
 
 WINTUN_MIN_RING_CAPACITY = 0x20000        # 128 KiB
