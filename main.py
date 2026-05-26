@@ -61,6 +61,16 @@ def _apply_theme() -> None:
         COLOR_PRIMARY_HOVER = _lighten(ui.accent, 0.18)
 
 
+def _asset_path(name: str) -> Path:
+    """Locate a bundled asset both when run from source and when frozen by
+    PyInstaller (data files live under sys._MEIPASS in the onedir bundle)."""
+    if getattr(sys, "frozen", False):
+        base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    else:
+        base = Path(__file__).resolve().parent
+    return base / name
+
+
 def fmt_bytes(n: float) -> str:
     if n < 1024:
         return f"{int(n)} B"
@@ -1171,6 +1181,7 @@ class App(ctk.CTk):
         self.geometry("960x600")
         self.minsize(360, 420)
         self.configure(fg_color=COLOR_BG)
+        self._set_app_icon()
 
         self.current: str | None = None
         self.activated_at: dict[str, float] = {}
@@ -1228,6 +1239,23 @@ class App(ctk.CTk):
         self.after(300, self._tick)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _set_app_icon(self):
+        """Set the window / taskbar icon to the bundled Octoweb icon."""
+        try:
+            ico = _asset_path("app.ico")
+            if ico.exists():
+                self.iconbitmap(default=str(ico))
+        except Exception:
+            pass
+        try:
+            from PIL import Image, ImageTk
+            png = _asset_path("appicon.png")
+            if png.exists():
+                self._app_icon_img = ImageTk.PhotoImage(Image.open(png))
+                self.iconphoto(True, self._app_icon_img)
+        except Exception:
+            pass
 
     def _build(self):
         self.grid_columnconfigure(1, weight=1)
